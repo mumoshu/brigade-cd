@@ -1,0 +1,19 @@
+apiVersion: helmfile.helm.sh/v1alpha1
+kind: ReleaseSet
+metadata:
+  name: myapp
+  annotations:
+    approved: "true"
+    cd.brigade.sh/github-pull-id: "3"
+    cd.brigade.sh/github-app-inst-id: "1247339"
+  finalizers:
+    - finalizer.helmfile.helm.sh
+spec:
+  foo: bar
+  values:
+    k1: v2
+  releases:
+    - name: myapp
+      chart: charts/mychart
+  finalizers:
+    - finalizer.helmfile.helm.sh

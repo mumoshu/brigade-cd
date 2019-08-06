@@ -5,6 +5,8 @@ import (
 	"fmt"
 	"github.com/mumoshu/brigade-cd/pkg/customresource"
 	"io/ioutil"
+	"k8s.io/client-go/kubernetes"
+	"k8s.io/client-go/tools/clientcmd"
 	"log"
 	"net/http"
 	"os"
@@ -27,6 +29,7 @@ var (
 	keyFile        string
 	allowedAuthors authors
 	emittedEvents  events
+	mappings Mappings
 )
 
 // defaultAllowedAuthors is the default set of authors allowed to PR
@@ -36,18 +39,18 @@ var defaultAllowedAuthors = []string{"COLLABORATOR", "OWNER", "MEMBER"}
 // defaultEmittedEvents is the default set of events to be emitted by the gateway
 var defaultEmittedEvents = []string{"*"}
 
-func init() {
-	flag.StringVar(&kubeconfig, "kubeconfig", "", "absolute path to the kubeconfig file")
-	flag.StringVar(&master, "master", "", "master url")
-	flag.StringVar(&namespace, "namespace", defaultNamespace(), "kubernetes namespace")
-	flag.StringVar(&gatewayPort, "gateway-port", defaultGatewayPort(), "TCP port to use for brigade-cd")
-	flag.StringVar(&keyFile, "key-file", "/etc/brigade-cd/key.pem", "path to x509 key for GitHub app")
-	flag.Var(&allowedAuthors, "authors", "allowed author associations, separated by commas (COLLABORATOR, CONTRIBUTOR, FIRST_TIMER, FIRST_TIME_CONTRIBUTOR, MEMBER, OWNER, NONE)")
-	flag.Var(&emittedEvents, "events", "events to be emitted and passed to worker, separated by commas (defaults to `*`, which matches everything)")
-}
-
 func main() {
-	flag.Parse()
+	flags := flag.NewFlagSet(os.Args[0], flag.ExitOnError)
+	flags.StringVar(&kubeconfig, "kubeconfig", "", "absolute path to the kubeconfig file")
+	flags.StringVar(&master, "master", "", "master url")
+	flags.StringVar(&namespace, "namespace", defaultNamespace(), "kubernetes namespace")
+	flags.StringVar(&gatewayPort, "gateway-port", defaultGatewayPort(), "TCP port to use for brigade-cd")
+	flags.StringVar(&keyFile, "key-file", "/etc/brigade-cd/key.pem", "path to x509 key for GitHub app")
+	flags.Var(&allowedAuthors, "authors", "allowed author associations, separated by commas (COLLABORATOR, CONTRIBUTOR, FIRST_TIMER, FIRST_TIME_CONTRIBUTOR, MEMBER, OWNER, NONE)")
+	flags.Var(&emittedEvents, "events", "events to be emitted and passed to worker, separated by commas (defaults to `*`, which matches everything)")
+	flags.Var(&mappings, "mapping", "Mappings from custom resources to Brigade projects")
+
+	flags.Parse(os.Args[1:])
 
 	if len(keyFile) == 0 {
 		log.Fatal("Key file is required")
@@ -93,13 +96,20 @@ func main() {
 		return realVal
 	}
 
+	appID := envOrInt("APP_ID", 0)
 	ghOpts := webhook.GithubOpts{
-		AppID:               envOrInt("APP_ID", 0),
+		AppID:               appID,
 		DefaultSharedSecret: os.Getenv("DEFAULT_SHARED_SECRET"),
 		EmittedEvents:       emittedEvents,
 	}
 
-	clientset, err := kube.GetClient(master, kubeconfig)
+	kc, err := clientcmd.BuildConfigFromFlags(master, kubeconfig)
+	if err != nil {
+		log.Fatal(err)
+	}
+
+	// creates the clientset
+	clientset, err := kubernetes.NewForConfig(kc)
 	if err != nil {
 		log.Fatal(err)
 	}
@@ -118,8 +128,8 @@ func main() {
 
 	router.GET("/healthz", healthz)
 
-	keys := []customresource.Mapping{}
-	c := customresource.New(store, keys)
+	keys := mappings
+	c := customresource.New(store, appID, key, kc, keys)
 	if err := c.Run(); err != nil {
 		log.Fatal(err)
 	}
@@ -146,6 +156,44 @@ func defaultGatewayPort() string {
 
 func healthz(c *gin.Context) {
 	c.String(http.StatusOK, http.StatusText(http.StatusOK))
+}
+
+type Mappings []customresource.Mapping
+
+func (a *Mappings) Set(value string) error {
+	m := customresource.Mapping{
+		Group:          "",
+		Version:        "",
+		Kind:           "",
+		BrigadeProject: "",
+	}
+	kvs := strings.Split(value, ",")
+	for i, kv := range kvs {
+		split := strings.Split(kv, "=")
+		k, v := split[0], split[1]
+		switch k {
+		case "group", "g":
+			m.Group = v
+		case "version", "v":
+			m.Version = v
+		case "kind", "k":
+			m.Kind = v
+		case "project", "p":
+			m.BrigadeProject = v
+		default:
+			return fmt.Errorf("unexpected key at index %d, %q, in input %q", i, k, value)
+		}
+	}
+	*a = append(*a, m)
+	return nil
+}
+
+func (a *Mappings) String() string {
+	strs := []string{}
+	for _, m := range *a {
+		strs = append(strs, fmt.Sprintf("%v", m))
+	}
+	return strings.Join(strs, " ")
 }
 
 type authors []string

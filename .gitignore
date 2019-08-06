@@ -3,3 +3,4 @@
 *~
 Gopkg*
 /brigade-cd
+.envrc

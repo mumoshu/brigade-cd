@@ -1,0 +1,17 @@
+tasks:
+  initcrd:
+    script: |
+      kubectl apply -f docs/releaseset.crd.yaml
+
+  myapp:
+    tasks:
+      init:
+        script: |
+          kubectl apply -f docs/myapp.releaseset.yaml
+      update:
+        script: |
+          kubectl apply -f docs/myapp.releaseset.2.yaml
+      delete:
+        script: |
+          kubectl apply -f docs/myapp.releaseset.3.yaml
+          kubectl delete -f docs/myapp.releaseset.yaml

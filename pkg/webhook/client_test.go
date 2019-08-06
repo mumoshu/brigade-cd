@@ -13,7 +13,7 @@ func TestGHClient(t *testing.T) {
 		UploadURL: "http://example.com/upload/",
 	}
 
-	c, err := ghClient(gh)
+	c, err := GhClient(gh)
 	if err != nil {
 		t.Fatal(err)
 	}

@@ -6,11 +6,11 @@ import (
 	"fmt"
 	"github.com/brigadecore/brigade/pkg/brigade"
 	"github.com/brigadecore/brigade/pkg/storage"
-	"k8s.io/apimachinery/pkg/api/errors"
-	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
-	"k8s.io/apimachinery/pkg/types"
+	"github.com/mumoshu/brigade-cd/pkg/webhook"
+	"k8s.io/client-go/rest"
 	"os"
 	"sigs.k8s.io/controller-runtime/pkg/client"
+	"strconv"
 	"strings"
 	"time"
 
@@ -28,28 +28,12 @@ import (
 	"github.com/summerwind/whitebox-controller/reconciler/state"
 )
 
-// Payload represents the data sent as the payload of an event.
-type Payload struct {
-	Type         string      `json:"type"`
-	Token        string      `json:"token"`
-	TokenExpires time.Time   `json:"tokenExpires"`
-	Body         interface{} `json:"body"`
-	AppID        int         `json:"-"`
-	InstID       int         `json:"-"`
-	Commit       string      `json:"commit"`
-	Branch       string      `json:"branch"`
-}
-
 type Object struct {
 	metav1.TypeMeta   `json:",inline"`
 	metav1.ObjectMeta `json:"metadata,omitempty"`
 
-	Spec   Spec   `json:"spec"`
-	Status Status `json:"status"`
-}
-
-type Spec struct {
-	Raw map[string]interface{} `json:",inline"`
+	Spec   map[string]interface{} `json:"spec"`
+	Status Status                 `json:"status"`
 }
 
 type Status struct {
@@ -61,14 +45,21 @@ type State struct {
 }
 
 type Handler struct {
-	store                            storage.Store
-	brigadeProject                   string
-	eventTypeUpdate, eventTypeDelete string
-	branch                           string
+	store                  storage.Store
+	brigadeProject         string
+	eventTypeActionApply   string
+	eventTypeActionDestroy string
+	eventTypeActionPlan    string
+	defaultBranch          string
 
 	kubeclient client.Client
 
 	groupVersionKind schema.GroupVersionKind
+
+	// key is the x509 certificate key as ASCII-armored (PEM) data
+	key []byte
+
+	appID int
 }
 
 func (h *Handler) HandleState(ss *state.State) error {
@@ -81,59 +72,116 @@ func (h *Handler) HandleState(ss *state.State) error {
 
 	o := s.Object
 
-	// Here we build/populate Brigade's webhook.Payload object
+	// Here we build/populate Brigade's Payload object
 	//
-	// Note we also add commit and branch data here, as neither is
-	// included in the github.IssueCommentEvent (here res.Body)
+	// Note we also add commit and defaultBranch data here, as neither is
+	// included in the github.IssueCommentEvent (here payload.Body)
 	// The check run utility that requests check runs requires these values
 	// and does not have access to he brigade.Revision object above.
-	res := &Payload{
-		//AppID:        appID,
-		//InstID:       int(instID),
-		Type: strings.ToLower(o.Kind),
+	eventType := strings.ToLower(o.Kind)
+	payload := &Payload{
+		Type: eventType,
 		//Token:        tok,
 		//TokenExpires: timeout,
 		//Commit:       rev.Commit,
-		Branch: h.branch,
+		//Branch: h.defaultBranch,
 	}
 
-	body, err := json.Marshal(o)
+	instIDStr := o.Annotations["cd.brigade.sh/github-app-inst-id"]
+	approvedStr := o.Annotations["cd.brigade.sh/approved"]
+	dryRunStr := o.Annotations["cd.brigade.sh/dry-run"]
+	gitRepo := o.Annotations["cd.brigade.sh/git-repo"]
+	gitCommitId := o.Annotations["cd.brigade.sh/git-commit"]
+	gitBranch := o.Annotations["cd.brigade.sh/git-branch"]
+	pullIdStr := o.Annotations["cd.brigade.sh/github-pull-id"]
+
+	{
+		tmp := strings.Split(gitRepo, "/")
+		owner := tmp[0]
+		repo := tmp[1]
+		payload.Owner = owner
+		payload.Repo = repo
+		payload.Pull = pullIdStr
+	}
+
+	if gitCommitId != "" {
+		payload.Commit = gitCommitId
+	} else {
+		payload.Branch = h.defaultBranch
+	}
+
+	if gitBranch != "" {
+		payload.Branch = gitBranch
+	}
+
+	appID := h.appID
+	payload.AppID = appID
+
+	var instID int
+	if len(instIDStr) > 0 {
+		instID, err = strconv.Atoi(instIDStr)
+		if err != nil {
+			return fmt.Errorf("failed converting %q: %v", instIDStr, err)
+		}
+		payload.InstID = instID
+	}
+
+	projName := h.brigadeProject
+
+	proj, err := h.store.GetProject(projName)
 	if err != nil {
+		fmt.Fprintf(os.Stderr, "Project %q not found. No secret loaded. %s\n", projName, err)
+		return err
+	}
+
+	if instID > 0 && appID > 0 {
+		tok, timeout, err := h.installationToken(int(appID), int(instID), proj.Github)
+		if err != nil {
+			return fmt.Errorf("Failed to negotiate a token: %s", err)
+		}
+		payload.Token = tok
+		payload.TokenExpires = timeout
+	}
+
+	// Check if it can be marshalled into JSON
+	if _, err := json.Marshal(o); err != nil {
 		fmt.Fprintf(os.Stderr, "Failed to marshal object into body: %s\n", err)
 		return err
 	}
-	res.Body = body
 
-	payload, err := json.Marshal(res)
-	if err != nil {
-		fmt.Fprintf(os.Stderr, "JSON encoding error: %v\n", err)
-		return err
-	}
+	pullUrl := fmt.Sprintf(`https://api.github.com/repos/%s/pulls/%s`, projName, pullIdStr)
+	payload.PullURL = pullUrl
 
-	proj, err := h.store.GetProject(h.brigadeProject)
-	if err != nil {
-		fmt.Fprintf(os.Stderr, "Project %q not found. No secret loaded. %s\n", h.brigadeProject, err)
-		return err
-	}
+	// Save the object as-is for use from within brigade.js
+	payload.Body = o
 
-	obj := &unstructured.Unstructured{}
-	//instanceList := &unstructured.UnstructuredList{}
-	//instanceList.SetGroupVersionKind(h.groupVersionKind)
-	namespacedName := types.NamespacedName{Name: o.Name, Namespace: o.Namespace}
-	err = h.kubeclient.Get(context.TODO(), namespacedName, obj)
-
-	var eventType string
-	if err != nil {
-		if errors.IsNotFound(err) {
-			eventType = h.eventTypeDelete
-		} else {
-			return err
-		}
+	//obj := &unstructured.Unstructured{}
+	//obj.SetGroupVersionKind(h.groupVersionKind)
+	////instanceList := &unstructured.UnstructuredList{}
+	////instanceList.SetGroupVersionKind(h.groupVersionKind)
+	//namespacedName := types.NamespacedName{Name: o.Name, Namespace: o.Namespace}
+	//err = h.kubeclient.Get(context.TODO(), namespacedName, obj)
+	//
+	//var eventTypeAction string
+	//if err != nil {
+	//	if errors.IsNotFound(err) || {
+	//		eventTypeAction = h.eventTypeActionDestroy
+	//	} else {
+	//		return err
+	//	}
+	//} else {
+	//	eventTypeAction = h.eventTypeActionApply
+	//}
+	var eventTypeAction string
+	if o.ObjectMeta.DeletionTimestamp != nil {
+		eventTypeAction = h.eventTypeActionDestroy
+	} else if approvedStr == "" || approvedStr == "true" || approvedStr == "yes" && (dryRunStr == "" || dryRunStr == "no" || dryRunStr == "false") {
+		eventTypeAction = h.eventTypeActionApply
 	} else {
-		eventType = h.eventTypeUpdate
+		eventTypeAction = h.eventTypeActionPlan
 	}
 
-	if err := h.build(eventType, payload, proj); err != nil {
+	if err := h.build(eventTypeAction, payload, proj); err != nil {
 		return err
 	}
 
@@ -149,14 +197,24 @@ func (h *Handler) HandleState(ss *state.State) error {
 	return nil
 }
 
-func (h *Handler) build(eventType string, payload []byte, proj *brigade.Project) error {
+func (h *Handler) build(eventAction string, payload *Payload, proj *brigade.Project) error {
+	payloadJsonBytes, err := json.Marshal(payload)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "JSON encoding error: %v\n", err)
+		return err
+	}
+
 	b := &brigade.Build{
 		ProjectID: proj.ID,
-		Type:      eventType,
+		Type:      eventAction,
 		Provider:  "brigade-cd",
-		//Revision:  &rev,
-		Payload: payload,
+		Revision: &brigade.Revision{
+			Commit: payload.Commit,
+			Ref:    fmt.Sprintf("refs/heads/%s", payload.Branch),
+		},
+		Payload: payloadJsonBytes,
 	}
+	fmt.Fprintf(os.Stderr, "Emitting event %q, payload %s\n", eventAction, payload)
 	return h.store.CreateBuild(b)
 }
 
@@ -166,14 +224,21 @@ type Mapping struct {
 }
 
 type controller struct {
-	keys []Mapping
-	s    storage.Store
+	mappings []Mapping
+	s        storage.Store
+	kc       *rest.Config
+	// key is the x509 certificate key as ASCII-armored (PEM) data
+	key   []byte
+	appID int
 }
 
-func New(s storage.Store, mappings []Mapping) *controller {
+func New(s storage.Store, appID int, key []byte, kc *rest.Config, mappings []Mapping) *controller {
 	return &controller{
-		s:    s,
-		keys: mappings,
+		s:        s,
+		mappings: mappings,
+		kc:       kc,
+		key:      key,
+		appID:    appID,
 	}
 }
 
@@ -182,7 +247,7 @@ func (ct *controller) Run() error {
 
 	configs := []*config.ResourceConfig{}
 	handlers := []*Handler{}
-	for _, k := range ct.keys {
+	for _, k := range ct.mappings {
 		groupVersionKind := schema.GroupVersionKind{
 			Group:   k.Group,
 			Version: k.Version,
@@ -190,12 +255,15 @@ func (ct *controller) Run() error {
 		}
 		lkind := strings.ToLower(k.Kind)
 		handler := &Handler{
-			store:           ct.s,
-			brigadeProject:  k.BrigadeProject,
-			eventTypeDelete: fmt.Sprintf("%s:delete", lkind),
-			eventTypeUpdate: fmt.Sprintf("%s:update", lkind),
-			branch:          "master",
-			groupVersionKind: groupVersionKind,
+			store:                  ct.s,
+			brigadeProject:         k.BrigadeProject,
+			eventTypeActionDestroy: fmt.Sprintf("%s:destroy", lkind),
+			eventTypeActionApply:   fmt.Sprintf("%s:apply", lkind),
+			eventTypeActionPlan:    fmt.Sprintf("%s:plan", lkind),
+			defaultBranch:          "master",
+			groupVersionKind:       groupVersionKind,
+			key:                    ct.key,
+			appID:                  ct.appID,
 		}
 		cfg := &config.ResourceConfig{
 			GroupVersionKind: groupVersionKind,
@@ -214,10 +282,16 @@ func (ct *controller) Run() error {
 		Resources: configs,
 	}
 
-	kc, err := kconfig.GetConfig()
-	if err != nil {
-		fmt.Fprintf(os.Stderr, "Failed to load kubeconfig: %s\n", err)
-		return err
+	var kc *rest.Config
+	if ct.kc != nil {
+		kc = ct.kc
+	} else {
+		var err error
+		kc, err = kconfig.GetConfig()
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "Failed to load kubeconfig: %s\n", err)
+			return err
+		}
 	}
 
 	mgr, err := manager.New(c, kc)
@@ -239,4 +313,31 @@ func (ct *controller) Run() error {
 	}()
 
 	return nil
+}
+
+func (s *Handler) installationToken(appID, installationID int, cfg brigade.Github) (string, time.Time, error) {
+	aidStr := strconv.Itoa(appID)
+	// We need to perform auth here, and then inject the token into the
+	// body so that the app can use it.
+	tok, err := webhook.JWT(aidStr, s.key)
+	if err != nil {
+		return "", time.Time{}, err
+	}
+
+	ghc, err := webhook.GhClient(brigade.Github{
+		Token:     tok,
+		BaseURL:   cfg.BaseURL,
+		UploadURL: cfg.UploadURL,
+	})
+
+	if err != nil {
+		return "", time.Time{}, err
+	}
+
+	ctx := context.Background()
+	itok, _, err := ghc.Apps.CreateInstallationToken(ctx, int64(installationID))
+	if err != nil {
+		return "", time.Time{}, err
+	}
+	return itok.GetToken(), itok.GetExpiresAt(), nil
 }

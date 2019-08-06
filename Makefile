@@ -90,10 +90,11 @@ test:
 # Build / Publish                                                              #
 ################################################################################
 
-IMAGES = brigade-github-app brigade-github-check-run
+IMAGES = brigade-cd
 
 .PHONY: build
-build: build-all-images
+build:
+	GO111MODULE=on go build -o brigade-cd ./cmd/brigade-cd
 
 # To use build-all-images, you need to have Docker installed and configured. You
 # should also set DOCKER_REGISTRY and DOCKER_ORG to your own personal registry

@@ -25,13 +25,13 @@ var (
 // StatusContext names the context for a particular status message.
 const StatusContext = "brigade"
 
-// ghClient gets a new GitHub client object.
+// GhClient gets a new GitHub client object.
 //
 // It authenticates with an OAUTH2 token.
 //
 // If an enterpriseHost base URL is provided, this will attempt to connect to
 // that instead of the hosted GitHub API server.
-func ghClient(gh brigade.Github) (*github.Client, error) {
+func GhClient(gh brigade.Github) (*github.Client, error) {
 	t := oauth2.StaticTokenSource(&oauth2.Token{AccessToken: gh.Token})
 	c := context.Background()
 	tc := oauth2.NewClient(c, t)
@@ -51,7 +51,7 @@ func setRepoStatus(commit string, proj *brigade.Project, status *github.RepoStat
 		return fmt.Errorf("project name %q is malformed", proj.Repo.Name)
 	}
 	c := context.Background()
-	client, err := ghClient(proj.Github)
+	client, err := GhClient(proj.Github)
 	if err != nil {
 		return err
 	}
@@ -68,7 +68,7 @@ func setRepoStatus(commit string, proj *brigade.Project, status *github.RepoStat
 // The ref can be a SHA or a branch or tag.
 func GetRepoStatus(proj *brigade.Project, ref string) (*github.RepoStatus, error) {
 	c := context.Background()
-	client, err := ghClient(proj.Github)
+	client, err := GhClient(proj.Github)
 	if err != nil {
 		return nil, err
 	}
@@ -91,7 +91,7 @@ func GetRepoStatus(proj *brigade.Project, ref string) (*github.RepoStatus, error
 // GetLastCommit gets the last commit on the give reference (branch name or tag).
 func GetLastCommit(proj *brigade.Project, ref string) (string, error) {
 	c := context.Background()
-	client, err := ghClient(proj.Github)
+	client, err := GhClient(proj.Github)
 	if err != nil {
 		return "", err
 	}
@@ -106,7 +106,7 @@ func GetLastCommit(proj *brigade.Project, ref string) (string, error) {
 // GetFileContents returns the contents for a particular file in the project.
 func GetFileContents(proj *brigade.Project, ref, path string) ([]byte, error) {
 	c := context.Background()
-	client, err := ghClient(proj.Github)
+	client, err := GhClient(proj.Github)
 	if err != nil {
 		return []byte{}, err
 	}
@@ -133,7 +133,7 @@ func (s *githubHook) installationToken(appID, installationID int, cfg brigade.Gi
 		return "", time.Time{}, err
 	}
 
-	ghc, err := ghClient(brigade.Github{
+	ghc, err := GhClient(brigade.Github{
 		Token:     tok,
 		BaseURL:   cfg.BaseURL,
 		UploadURL: cfg.UploadURL,
